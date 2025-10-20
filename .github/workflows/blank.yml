@@ -1,0 +1,129 @@
+import os
+from gmssl import sm3, sm4  # 直接使用sm4模块的底层函数
+import base64
+
+
+class SM3SM4Crypto:
+    """兼容无SM4类的gmssl版本，使用底层函数实现"""
+    
+    def __init__(self):
+        self.salt_len = 16  # 盐值长度(字节)
+        self.iv_len = 16  # SM4-CBC模式IV长度(16字节)
+        self.sm3_hash_len = 32  # SM3哈希长度(字节)
+
+    def _derive_key(self, password: bytes, salt: bytes, iterations: int = 10000) -> bytes:
+        """基于SM3的密钥派生"""
+        key = b""
+        current = b""
+        while len(key) < self.sm3_hash_len:
+            # SM3哈希需传入字节列表
+            hash_input = current + password + salt
+            current_hex = sm3.sm3_hash(list(hash_input))
+            current = bytes.fromhex(current_hex)
+            key += current
+            iterations -= 1
+            if iterations <= 0:
+                break
+        return key[:self.sm3_hash_len]
+
+    def _sm4_encrypt_cbc(self, key: bytes, iv: bytes, data: bytes) -> bytes:
+        """SM4-CBC加密（使用底层函数）"""
+        # 确保密钥和IV长度正确
+        if len(key) != 16 or len(iv) != 16:
+            raise ValueError("SM4密钥和IV必须为16字节")
+        # 对数据进行PKCS#7填充（CBC模式要求数据长度为16字节倍数）
+        pad_len = 16 - (len(data) % 16)
+        data_padded = data + bytes([pad_len]) * pad_len
+        # 调用底层加密函数（返回十六进制字符串）
+        ciphertext_hex = sm4.sm4_crypt(key, iv, data_padded, 1)  # 1表示加密
+        return bytes.fromhex(ciphertext_hex)
+
+    def _sm4_decrypt_cbc(self, key: bytes, iv: bytes, data: bytes) -> bytes:
+        """SM4-CBC解密（使用底层函数）"""
+        if len(key) != 16 or len(iv) != 16:
+            raise ValueError("SM4密钥和IV必须为16字节")
+        # 调用底层解密函数（输入为十六进制字符串）
+        data_hex = data.hex()
+        plaintext_padded_hex = sm4.sm4_crypt(key, iv, data_hex, 0)  # 0表示解密
+        plaintext_padded = bytes.fromhex(plaintext_padded_hex)
+        # 去除PKCS#7填充
+        pad_len = plaintext_padded[-1]
+        return plaintext_padded[:-pad_len]
+
+    def encrypt(self, plaintext: str, password: str) -> str:
+        """加密流程"""
+        plaintext_bytes = plaintext.encode('utf-8')
+        password_bytes = password.encode('utf-8')
+        
+        # 生成随机盐值和IV
+        salt = os.urandom(self.salt_len)
+        iv = os.urandom(self.iv_len)
+        
+        # 派生密钥
+        derived_key = self._derive_key(password_bytes, salt)
+        sm4_key = derived_key[:16]  # SM4密钥(16字节)
+        verify_key = derived_key[16:]  # 验证用密钥
+        
+        # SM4加密
+        ciphertext = self._sm4_encrypt_cbc(sm4_key, iv, plaintext_bytes)
+        
+        # 生成完整性校验哈希
+        verify_data = verify_key + ciphertext
+        verify_hash_hex = sm3.sm3_hash(list(verify_data))
+        verify_hash_bytes = bytes.fromhex(verify_hash_hex)
+        
+        # 拼接并编码
+        encrypted_data = salt + iv + ciphertext + verify_hash_bytes
+        return base64.b64encode(encrypted_data).decode('utf-8')
+
+    def decrypt(self, ciphertext_b64: str, password: str) -> str:
+        """解密流程"""
+        try:
+            encrypted_data = base64.b64decode(ciphertext_b64)
+        except Exception as e:
+            raise ValueError(f"Base64解码失败: {str(e)}")
+        
+        # 验证数据长度
+        min_len = self.salt_len + self.iv_len + self.sm3_hash_len
+        if len(encrypted_data) < min_len:
+            raise ValueError("加密数据不完整")
+        
+        # 拆分数据
+        salt = encrypted_data[:self.salt_len]
+        iv = encrypted_data[self.salt_len : self.salt_len + self.iv_len]
+        ciphertext = encrypted_data[self.salt_len + self.iv_len : -self.sm3_hash_len]
+        received_hash = encrypted_data[-self.sm3_hash_len:]
+        
+        # 派生密钥
+        password_bytes = password.encode('utf-8')
+        derived_key = self._derive_key(password_bytes, salt)
+        sm4_key = derived_key[:16]
+        verify_key = derived_key[16:]
+        
+        # 验证完整性
+        verify_data = verify_key + ciphertext
+        computed_hash_hex = sm3.sm3_hash(list(verify_data))
+        computed_hash_bytes = bytes.fromhex(computed_hash_hex)
+        if computed_hash_bytes != received_hash:
+            raise ValueError("数据完整性校验失败，可能被篡改或密码错误")
+        
+        # SM4解密
+        plaintext_bytes = self._sm4_decrypt_cbc(sm4_key, iv, ciphertext)
+        return plaintext_bytes.decode('utf-8')
+
+
+# 测试代码
+if __name__ == "__main__":
+    crypto = SM3SM4Crypto()
+    password = "test_compatible_version"
+    plaintext = "测试兼容无SM4类的gmssl版本"
+    
+    encrypted = crypto.encrypt(plaintext, password)
+    print(f"加密后: {encrypted}")
+    
+    try:
+        decrypted = crypto.decrypt(encrypted, password)
+        print(f"解密后: {decrypted}")
+        print(f"验证结果: {'一致' if decrypted == plaintext else '不一致'}")
+    except Exception as e:
+        print(f"错误: {e}")
